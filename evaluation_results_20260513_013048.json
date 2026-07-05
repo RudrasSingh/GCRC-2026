@@ -1,0 +1,71 @@
+{
+  "AES-256": {
+    "name": "AES-256",
+    "timestamp": "2026-05-13T01:30:48.374711",
+    "samples": 1000,
+    "entropy": {
+      "byte_entropy": 7.995936032478031,
+      "bit_entropy": 0.999996710649676,
+      "chi_square": 1.7510416666666666,
+      "max_byte_entropy": 8.0,
+      "max_bit_entropy": 0.5
+    },
+    "avalanche": {
+      "mean": 41.69348958333333,
+      "std": 8.715599194061383,
+      "min": 26.302083333333332,
+      "max": 57.03125,
+      "ideal": 50.0
+    },
+    "performance": {
+      "mean_time_ms": 0.021472000025823945,
+      "throughput_mbps": 1.4212731971077273
+    }
+  },
+  "AES-128": {
+    "name": "AES-128",
+    "timestamp": "2026-05-13T01:30:48.590479",
+    "samples": 1000,
+    "entropy": {
+      "byte_entropy": 7.996009753300234,
+      "bit_entropy": 0.9999973500481114,
+      "chi_square": 1.4106666666666667,
+      "max_byte_entropy": 8.0,
+      "max_bit_entropy": 0.5
+    },
+    "avalanche": {
+      "mean": 41.96484375,
+      "std": 8.639461660528719,
+      "min": 27.864583333333332,
+      "max": 57.8125,
+      "ideal": 50.0
+    },
+    "performance": {
+      "mean_time_ms": 0.01922199991895468,
+      "throughput_mbps": 1.5876380321335257
+    }
+  },
+  "3DES": {
+    "name": "3DES",
+    "timestamp": "2026-05-13T01:30:48.756604",
+    "samples": 1000,
+    "entropy": {
+      "byte_entropy": 7.995967252904998,
+      "bit_entropy": 0.9999998196631124,
+      "chi_square": 0.08,
+      "max_byte_entropy": 8.0,
+      "max_bit_entropy": 0.5
+    },
+    "avalanche": {
+      "mean": 34.7575,
+      "std": 11.121935252014373,
+      "min": 14.0625,
+      "max": 56.875,
+      "ideal": 50.0
+    },
+    "performance": {
+      "mean_time_ms": 0.02107199992678943,
+      "throughput_mbps": 1.4482525736060836
+    }
+  }
+}
