@@ -1,47 +1,48 @@
-# Docker Deployment
+# Docker & Cloud Deployment
 
-This repository includes a container image for the FastAPI server.
+This repository containerizes the FastAPI API server, making it ready for local running or production cloud platforms (like Render, AWS, Heroku, etc.).
 
-## Files
+---
 
-- `Dockerfile` builds the API server image.
-- `docker-compose.yml` runs the server locally on port `8000`.
-- `.env` can be used to pass Supabase credentials and the optional legacy API key.
+## Deployment Configuration
 
-## Start the server
+Production platforms like Render build the application using the [`Dockerfile`](file:///d:/Developer/analysis/Dockerfile).
+Since your local [`.env`](file:///d:/Developer/analysis/.env) contains private database credentials, it is included in [`.gitignore`](file:///d:/Developer/analysis/.gitignore) and is not pushed to GitHub.
 
+As a result:
+*   The `Dockerfile` does **not** copy the `.env` file during the build stage.
+*   Instead, environment variables are injected at runtime by the host environment (Render Dashboard settings or Docker Compose).
+
+---
+
+## How to Deploy on Render
+
+1.  **Create a Web Service:** Link your GitHub repository to a new Web Service on Render.
+2.  **Select Environment:** Choose **Docker** as the runtime.
+3.  **Configure Environment Variables:**
+    In the Render Web Service settings, add the following environment variables (using lowercase names as required by the backend config):
+    *   `user` (e.g. `postgres.bdentnuxdbeoafcpiqhh`)
+    *   `password` (your database password)
+    *   `host` (e.g. `aws-1-ap-south-1.pooler.supabase.com`)
+    *   `port` (e.g. `6543`)
+    *   `dbname` (e.g. `postgres`)
+
+Render will build the Docker container and automatically run the FastAPI server, exposing it publicly.
+
+---
+
+## Running Locally
+
+### 1. Build and Start the Stack
+To boot the FastAPI server locally inside a Docker container:
 ```bash
 docker compose up --build
 ```
+This loads your local `.env` variables and starts the API listening on `http://localhost:8000`.
 
-The API will be available at `http://localhost:8000`.
-
-## Test the endpoints
-
-1. Register a user.
-2. Copy the returned `api_key`.
-3. Use `/auth/me` to view the stored MLKEM public key for the account.
-4. Call the crypto and KEM endpoints with `X-API-Key`; the server uses the stored private key automatically unless you override the public key for a recipient.
-5. Use `/auth/api-keys` and `/auth/mlkem-keys/rotate` to manage the account state.
-
-## Supabase mode
-
-Set these environment variables when you want persistence:
-
+### 2. Database Bootstrapping
+Make sure your database tables are created before making requests. Run the local bootstrapper:
 ```bash
-SUPABASE_URL=...
-SUPABASE_SERVICE_ROLE_KEY=...
-SUPABASE_DB_URL=...
+python create_tables.py
 ```
-
-`SUPABASE_DB_URL` should be the Postgres connection string from your Supabase project. When all three variables are present, the server will create the required tables automatically on startup if they do not exist yet.
-
-If they are omitted, the server uses in-memory storage for local testing.
-
-For a travel-friendly setup, place the values in a local `.env` file and start the stack with:
-
-```bash
-docker compose up --build
-```
-
-The container will boot, bootstrap the database schema if Supabase credentials are present, and expose the API on `http://localhost:8000`.
+This script connects using the credentials in your `.env` file and executes the SQL schema queries. If credentials are not supplied, the backend repository defaults to a volatile in-memory fallback.
