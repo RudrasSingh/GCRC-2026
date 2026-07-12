@@ -11,8 +11,8 @@ def create_tables():
     user = os.getenv("user", "").strip()
     password = os.getenv("password", "").strip()
     host = os.getenv("host", "").strip()
-    port = os.getenv("port", "6543").strip()
-    dbname = os.getenv("dbname", "postgres").strip()
+    port = os.getenv("port", "").strip() or "6543"
+    dbname = os.getenv("dbname", "").strip() or "postgres"
 
     if not (user and password and host):
         print("Error: Database environment variables (user, password, host) are not fully set in .env.")
@@ -25,11 +25,10 @@ def create_tables():
     print("Connecting to database using SQLAlchemy...")
     try:
         engine = create_engine(db_url, poolclass=NullPool)
-        with engine.connect() as connection:
-            with connection.begin():
-                print("Executing schema script...")
-                connection.execute(text(SUPABASE_SCHEMA_SQL))
-                print("Tables created/verified successfully.")
+        with engine.begin() as connection:
+            print("Executing schema script...")
+            connection.execute(text(SUPABASE_SCHEMA_SQL))
+            print("Tables created/verified successfully.")
     except Exception as e:
         print(f"Error creating tables: {e}")
 

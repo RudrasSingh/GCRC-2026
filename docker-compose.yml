@@ -5,10 +5,6 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    environment:
-      user: ${user:-}
-      password: ${password:-}
-      host: ${host:-}
-      port: ${port:-6543}
-      dbname: ${dbname:-postgres}
+    env_file:
+      - .env
     restart: unless-stopped
