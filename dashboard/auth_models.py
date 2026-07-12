@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-
 EMAIL_PATTERN = r"^[^\s@]+@[^\s@]+\.[^\s@]+$"
 
 
@@ -17,16 +16,8 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=128)
 
 
-class ApiKeyIssueRequest(BaseModel):
-    label: str = Field(default="default", min_length=1, max_length=64)
-
-
 class MlkemKeyRotateRequest(BaseModel):
     confirm: bool = Field(default=True)
-
-
-class RevokeApiKeyRequest(BaseModel):
-    api_key_id: str = Field(..., min_length=8, max_length=128)
 
 
 class UserResponse(BaseModel):
@@ -34,26 +25,14 @@ class UserResponse(BaseModel):
     email: str
     full_name: str
     mlkem_public_key: str
+    mlkem_private_key: str | None = None
     created_at: float
-
-
-class ApiKeyResponse(BaseModel):
-    id: str
-    label: str
-    key_prefix: str
-    created_at: float
-    expires_at: float | None
-    revoked_at: float | None
-    last_used_at: float | None
 
 
 class AuthSessionResponse(BaseModel):
     user: UserResponse
-    api_key: str
-    api_key_id: str
-    api_key_prefix: str
+    session_token: str
 
 
 class AuthenticatedUserResponse(BaseModel):
     user: UserResponse
-    api_key: ApiKeyResponse

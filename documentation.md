@@ -1,25 +1,30 @@
-# API Endpoint Documentation
+# GCRC Cryptographic API Server Documentation
 
-This document describes all API endpoints exposed by the FastAPI server, detailing their authentication requirements, input schemas, and output payloads.
-
----
-
-## Authentication
-
-All endpoints except `/auth/register` and `/auth/login` require an `Authorization` header with a valid session token (Bearer token).
-
-**Example Request Header:**
-```http
-Authorization: Bearer YOUR_SESSION_TOKEN
-```
+This document describes the Zero-Knowledge Client-Managed key flow and provides a complete reference for all API endpoints, including input schemas, authentication requirements, and output payloads.
 
 ---
 
-## Authentication & Account Endpoints
+## Zero-Knowledge Key Management Flow
+
+To maximize privacy and security, the server enforces a **Zero-Knowledge client-managed private key model**:
+1.  **Public Key Storage:** The database only stores the user's ML-KEM public key (`mlkem_public_key_hex`). The database **never** stores or records the corresponding private key (`mlkem_private_key_hex`).
+2.  **Immediate Return:** When a user is registered (`/auth/register`), rotates their keys (`/auth/mlkem-keys/rotate`), or generates fresh KEM keys (`/kem/keygen`), the private key is returned **immediately** in the JSON response payload. The client **must** save this key locally (e.g. to a file or client vault).
+3.  **Authentication:** Auth endpoints return a `session_token`. All subsequent calls must present this token in the header:
+    ```http
+    Authorization: Bearer YOUR_SESSION_TOKEN
+    ```
+4.  **Decryption & Decapsulation:** Since the server does not store the private key, direct server-managed decryption/decapsulation is disabled (attempting to use `"managed-server-side"` returns `400 Bad Request`). The client must supply the private key in one of two ways:
+    *   **Ephemeral Handle:** Pass a valid `secret_key_handle` (the private key is temporarily registered in the server's memory cache for 24 hours during keygen).
+    *   **Raw Hex Key:** Pass the raw private key hex string directly as the `secret_key_handle`.
+
+---
+
+## Auth & Session Endpoints
 
 ### 1. `POST /auth/register`
-Registers a new user account, automatically generates their ML-KEM key pair, stores the public key (and private key as server backup) in the database, and returns the session token along with the user's private key.
+Creates a user account, generates the initial ML-KEM key pair, registers the public key, and returns the session token along with the private key.
 
+- **Authentication:** Public
 - **Request Body:**
   ```json
   {
@@ -36,18 +41,19 @@ Registers a new user account, automatically generates their ML-KEM key pair, sto
       "email": "user@example.com",
       "full_name": "John Doe",
       "mlkem_public_key": "HEX_ENCODED_PUBLIC_KEY",
-      "mlkem_private_key": "HEX_ENCODED_PRIVATE_KEY",
+      "mlkem_private_key": "HEX_ENCODED_PRIVATE_KEY_HERE",
       "created_at": 1690000000.0
     },
-    "session_token": "plain_session_token_string"
+    "session_token": "session_token_string"
   }
   ```
 
 ---
 
 ### 2. `POST /auth/login`
-Authenticates a user using email and password, and issues a new session token.
+Authenticates user credentials and issues a session token.
 
+- **Authentication:** Public
 - **Request Body:**
   ```json
   {
@@ -56,6 +62,7 @@ Authenticates a user using email and password, and issues a new session token.
   }
   ```
 - **Response Payload (200 OK):**
+  *(Note: `mlkem_private_key` is null as it is not stored in the database)*
   ```json
   {
     "user": {
@@ -63,20 +70,19 @@ Authenticates a user using email and password, and issues a new session token.
       "email": "user@example.com",
       "full_name": "John Doe",
       "mlkem_public_key": "HEX_ENCODED_PUBLIC_KEY",
-      "mlkem_private_key": "HEX_ENCODED_PRIVATE_KEY",
+      "mlkem_private_key": null,
       "created_at": 1690000000.0
     },
-    "session_token": "plain_session_token_string"
+    "session_token": "session_token_string"
   }
   ```
 
 ---
 
 ### 3. `POST /auth/logout`
-Terminates the current session by revoking the session token.
+Revokes the current session token.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Response Payload (200 OK):**
   ```json
   {
@@ -87,10 +93,9 @@ Terminates the current session by revoking the session token.
 ---
 
 ### 4. `GET /auth/me`
-Retrieves details of the currently authenticated user associated with the session.
+Retrieves details of the currently authenticated user session.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Response Payload (200 OK):**
   ```json
   {
@@ -99,7 +104,7 @@ Retrieves details of the currently authenticated user associated with the sessio
       "email": "user@example.com",
       "full_name": "John Doe",
       "mlkem_public_key": "HEX_ENCODED_PUBLIC_KEY",
-      "mlkem_private_key": "HEX_ENCODED_PRIVATE_KEY",
+      "mlkem_private_key": null,
       "created_at": 1690000000.0
     }
   }
@@ -108,10 +113,9 @@ Retrieves details of the currently authenticated user associated with the sessio
 ---
 
 ### 5. `POST /auth/mlkem-keys/rotate`
-Rotates the user's permanent ML-KEM key pair in the database and returns the new public and private keys.
+Rotates the user's permanent ML-KEM key pair, updating the public key in the database and returning the private key.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Request Body:**
   ```json
   {
@@ -124,21 +128,20 @@ Rotates the user's permanent ML-KEM key pair in the database and returns the new
     "id": "user_id_string",
     "email": "user@example.com",
     "full_name": "John Doe",
-    "mlkem_public_key": "HEX_ENCODED_PUBLIC_KEY",
-    "mlkem_private_key": "HEX_ENCODED_PRIVATE_KEY",
+    "mlkem_public_key": "NEW_HEX_ENCODED_PUBLIC_KEY",
+    "mlkem_private_key": "NEW_HEX_ENCODED_PRIVATE_KEY",
     "created_at": 1690000000.0
   }
   ```
 
 ---
 
-## Cryptography Endpoints
+## Cryptographic Endpoints
 
 ### 6. `POST /kem/keygen`
-Rotates the user's ML-KEM key pair, registers it in the ephemeral secret store, and returns both public/private keys and the temporary secret key handle.
+Generates a fresh ML-KEM key pair, registers the private key temporarily in the ephemeral `secret_store` (valid for 24 hours), updates the user's public key in the database, and returns the new keys and handle.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Response Payload (200 OK):**
   ```json
   {
@@ -154,8 +157,7 @@ Rotates the user's ML-KEM key pair, registers it in the ephemeral secret store, 
 ### 7. `POST /kem/encapsulate`
 Encapsulates a shared secret using either the user's public key (default) or a specified public key, returning the ciphertext and an ephemeral shared secret handle.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Request Body:**
   ```json
   {
@@ -176,16 +178,15 @@ Encapsulates a shared secret using either the user's public key (default) or a s
 ### 8. `POST /kem/decapsulate`
 Decapsulates Kyber ciphertext to derive the shared secret.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Request Body:**
   ```json
   {
     "ciphertext": "HEX_ENCODED_CIPHERTEXT",
-    "secret_key_handle": "managed-server-side"
+    "secret_key_handle": "HEX_ENCODED_PRIVATE_KEY_OR_EPHEMERAL_HANDLE"
   }
   ```
-  *(Note: `secret_key_handle` can be `"managed-server-side"`, an ephemeral `secret_key_handle`, or the raw hex private key)*
+  *(Note: Must be either the ephemeral key handle from keygen or the raw private key hex string. If left blank or set to `"managed-server-side"`, returns `400 Bad Request`)*
 
 - **Response Payload (200 OK):**
   ```json
@@ -200,8 +201,7 @@ Decapsulates Kyber ciphertext to derive the shared secret.
 ### 9. `POST /crypto/encrypt`
 Encrypts a message using post-quantum Kyber KEM coupled with GCRC DNA-based symmetric encryption.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Request Body:**
   ```json
   {
@@ -224,8 +224,7 @@ Encrypts a message using post-quantum Kyber KEM coupled with GCRC DNA-based symm
 ### 10. `POST /crypto/decrypt`
 Decrypts a DNA-GCRC encrypted package.
 
-- **Request Headers:**
-  `Authorization: Bearer YOUR_SESSION_TOKEN`
+- **Authentication:** Bearer Session Token
 - **Request Body:**
   ```json
   {
@@ -235,10 +234,10 @@ Decrypts a DNA-GCRC encrypted package.
       "hmac": "HEX_ENCODED_HMAC_SHA256",
       "length": 128
     },
-    "secret_key_handle": "managed-server-side"
+    "secret_key_handle": "HEX_ENCODED_PRIVATE_KEY_OR_EPHEMERAL_HANDLE"
   }
   ```
-  *(Note: `secret_key_handle` can be `"managed-server-side"`, an ephemeral `secret_key_handle`, or the raw hex private key)*
+  *(Note: Must be either the ephemeral key handle from keygen or the raw private key hex string. If left blank or set to `"managed-server-side"`, returns `400 Bad Request`)*
 
 - **Response Payload (200 OK):**
   ```json
@@ -249,11 +248,12 @@ Decrypts a DNA-GCRC encrypted package.
 
 ---
 
-## Live Monitoring / Status Endpoints
+## Live Monitoring & Status Endpoints
 
 ### 11. `POST /start-analysis`
-Starts the background GCRC cryptanalysis / metrics simulation loop.
+Starts the background GCRC cryptanalysis simulation.
 
+- **Authentication:** Public
 - **Response Payload (200 OK):**
   ```json
   {
@@ -264,8 +264,9 @@ Starts the background GCRC cryptanalysis / metrics simulation loop.
 ---
 
 ### 12. `GET /status`
-Fetches the active status and current stats (avalanche, entropy, serial correlation, chi-square) of the running cryptanalysis.
+Fetches active cryptanalysis status and metrics.
 
+- **Authentication:** Public
 - **Response Payload (200 OK):**
   ```json
   {

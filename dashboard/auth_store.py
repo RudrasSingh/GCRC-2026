@@ -8,17 +8,17 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin
 
-import requests
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 
 from pqc.kyber_mlkem import generate_keys
 
 
 PBKDF2_ITERATIONS = 200_000
 PASSWORD_SALT_BYTES = 16
-API_KEY_BYTES = 32
-DEFAULT_API_KEY_TTL_SECONDS = 30 * 24 * 60 * 60
+SESSION_TOKEN_BYTES = 32
+DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 
 SUPABASE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -28,25 +28,21 @@ CREATE TABLE IF NOT EXISTS users (
     password_salt TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     mlkem_public_key_hex TEXT NOT NULL,
-    mlkem_private_key_hex TEXT NOT NULL,
     created_at DOUBLE PRECISION NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE
 );
 
-CREATE TABLE IF NOT EXISTS api_keys (
+CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    key_hash TEXT UNIQUE NOT NULL,
-    key_prefix TEXT NOT NULL,
-    label TEXT NOT NULL DEFAULT 'default',
+    session_token TEXT UNIQUE NOT NULL,
     created_at DOUBLE PRECISION NOT NULL,
-    expires_at DOUBLE PRECISION,
-    revoked_at DOUBLE PRECISION,
-    last_used_at DOUBLE PRECISION
+    expires_at DOUBLE PRECISION NOT NULL,
+    revoked_at DOUBLE PRECISION
 );
 
-CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
-CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(session_token);
 """
 
 
@@ -58,29 +54,26 @@ class UserRecord:
     password_salt: str
     password_hash: str
     mlkem_public_key_hex: str
-    mlkem_private_key_hex: str
     created_at: float
     is_active: bool = True
 
 
 @dataclass
-class ApiKeyRecord:
+class SessionRecord:
     id: str
     user_id: str
-    key_hash: str
-    key_prefix: str
-    label: str
+    session_token: str
     created_at: float
-    expires_at: float | None = None
+    expires_at: float
     revoked_at: float | None = None
-    last_used_at: float | None = None
 
 
 @dataclass
 class AuthSession:
     user: UserRecord
-    api_key: ApiKeyRecord
-    plain_api_key: str
+    session_token: str
+    session: SessionRecord
+    mlkem_private_key: str | None = None
 
 
 class AuthError(Exception):
@@ -94,22 +87,16 @@ class _BaseAuthRepository:
     def authenticate(self, email: str, password: str) -> AuthSession:
         raise NotImplementedError
 
-    def issue_api_key(self, user_id: str, label: str = "default", ttl_seconds: int = DEFAULT_API_KEY_TTL_SECONDS) -> tuple[ApiKeyRecord, str]:
+    def logout(self, session_token: str) -> None:
         raise NotImplementedError
 
-    def verify_api_key(self, api_key: str) -> tuple[UserRecord, ApiKeyRecord]:
-        raise NotImplementedError
-
-    def list_api_keys(self, user_id: str) -> list[ApiKeyRecord]:
-        raise NotImplementedError
-
-    def revoke_api_key(self, user_id: str, api_key_id: str) -> None:
+    def verify_session(self, session_token: str) -> tuple[UserRecord, SessionRecord]:
         raise NotImplementedError
 
     def get_user_by_id(self, user_id: str) -> UserRecord:
         raise NotImplementedError
 
-    def rotate_mlkem_keys(self, user_id: str) -> UserRecord:
+    def rotate_mlkem_keys(self, user_id: str) -> tuple[UserRecord, str]:
         raise NotImplementedError
 
 
@@ -118,8 +105,8 @@ class InMemoryAuthRepository(_BaseAuthRepository):
         self._lock = threading.RLock()
         self._users_by_id: dict[str, UserRecord] = {}
         self._users_by_email: dict[str, str] = {}
-        self._keys_by_id: dict[str, ApiKeyRecord] = {}
-        self._keys_by_hash: dict[str, str] = {}
+        self._sessions_by_id: dict[str, SessionRecord] = {}
+        self._sessions_by_token: dict[str, str] = {}
 
     def create_user(self, email: str, full_name: str, password: str) -> AuthSession:
         normalized_email = email.strip().lower()
@@ -137,13 +124,17 @@ class InMemoryAuthRepository(_BaseAuthRepository):
                 password_salt=salt,
                 password_hash=password_hash,
                 mlkem_public_key_hex=public_key.hex(),
-                mlkem_private_key_hex=secret_key.hex(),
                 created_at=time.time(),
             )
             self._users_by_id[user.id] = user
             self._users_by_email[normalized_email] = user.id
-            api_key_record, plain_api_key = self._insert_key(user.id, label="default", ttl_seconds=DEFAULT_API_KEY_TTL_SECONDS)
-            return AuthSession(user=user, api_key=api_key_record, plain_api_key=plain_api_key)
+            session_record, plain_token = self._insert_session(user.id)
+            return AuthSession(
+                user=user,
+                session_token=plain_token,
+                session=session_record,
+                mlkem_private_key=secret_key.hex()
+            )
 
     def authenticate(self, email: str, password: str) -> AuthSession:
         normalized_email = email.strip().lower()
@@ -154,40 +145,30 @@ class InMemoryAuthRepository(_BaseAuthRepository):
             user = self._users_by_id[user_id]
             if not _verify_password(password, user.password_salt, user.password_hash):
                 raise AuthError("Invalid credentials")
-            api_key_record, plain_api_key = self._insert_key(user.id, label="login", ttl_seconds=DEFAULT_API_KEY_TTL_SECONDS)
-            return AuthSession(user=user, api_key=api_key_record, plain_api_key=plain_api_key)
+            session_record, plain_token = self._insert_session(user.id)
+            return AuthSession(user=user, session_token=plain_token, session=session_record)
 
-    def issue_api_key(self, user_id: str, label: str = "default", ttl_seconds: int = DEFAULT_API_KEY_TTL_SECONDS) -> tuple[ApiKeyRecord, str]:
+    def logout(self, session_token: str) -> None:
         with self._lock:
-            return self._insert_key(user_id, label=label, ttl_seconds=ttl_seconds)
+            session_id = self._sessions_by_token.get(session_token)
+            if session_id is not None:
+                session = self._sessions_by_id[session_id]
+                session.revoked_at = time.time()
 
-    def verify_api_key(self, api_key: str) -> tuple[UserRecord, ApiKeyRecord]:
-        key_hash = _hash_api_key(api_key)
+    def verify_session(self, session_token: str) -> tuple[UserRecord, SessionRecord]:
         with self._lock:
-            key_id = self._keys_by_hash.get(key_hash)
-            if key_id is None:
+            session_id = self._sessions_by_token.get(session_token)
+            if session_id is None:
                 raise AuthError("Unauthorized")
-            key = self._keys_by_id[key_id]
-            if key.revoked_at is not None:
+            session = self._sessions_by_id[session_id]
+            if session.revoked_at is not None:
                 raise AuthError("Unauthorized")
-            if key.expires_at is not None and key.expires_at < time.time():
+            if session.expires_at < time.time():
                 raise AuthError("Unauthorized")
-            user = self._users_by_id.get(key.user_id)
+            user = self._users_by_id.get(session.user_id)
             if user is None or not user.is_active:
                 raise AuthError("Unauthorized")
-            key.last_used_at = time.time()
-            return user, key
-
-    def list_api_keys(self, user_id: str) -> list[ApiKeyRecord]:
-        with self._lock:
-            return [key for key in self._keys_by_id.values() if key.user_id == user_id]
-
-    def revoke_api_key(self, user_id: str, api_key_id: str) -> None:
-        with self._lock:
-            key = self._keys_by_id.get(api_key_id)
-            if key is None or key.user_id != user_id:
-                raise AuthError("API key not found")
-            key.revoked_at = time.time()
+            return user, session
 
     def get_user_by_id(self, user_id: str) -> UserRecord:
         with self._lock:
@@ -196,31 +177,27 @@ class InMemoryAuthRepository(_BaseAuthRepository):
                 raise AuthError("User not found")
             return user
 
-    def rotate_mlkem_keys(self, user_id: str) -> UserRecord:
+    def rotate_mlkem_keys(self, user_id: str) -> tuple[UserRecord, str]:
         with self._lock:
             user = self._users_by_id.get(user_id)
             if user is None:
                 raise AuthError("User not found")
             public_key, secret_key = generate_keys()
             user.mlkem_public_key_hex = public_key.hex()
-            user.mlkem_private_key_hex = secret_key.hex()
-            return user
+            return user, secret_key.hex()
 
-    def _insert_key(self, user_id: str, label: str, ttl_seconds: int) -> tuple[ApiKeyRecord, str]:
-        plain_api_key = _issue_plain_api_key()
-        key_hash = _hash_api_key(plain_api_key)
-        record = ApiKeyRecord(
+    def _insert_session(self, user_id: str, ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS) -> tuple[SessionRecord, str]:
+        plain_token = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
+        record = SessionRecord(
             id=secrets.token_urlsafe(16),
             user_id=user_id,
-            key_hash=key_hash,
-            key_prefix=plain_api_key[:8],
-            label=label,
+            session_token=plain_token,
             created_at=time.time(),
-            expires_at=time.time() + ttl_seconds if ttl_seconds else None,
+            expires_at=time.time() + ttl_seconds,
         )
-        self._keys_by_id[record.id] = record
-        self._keys_by_hash[key_hash] = record.id
-        return record, plain_api_key
+        self._sessions_by_id[record.id] = record
+        self._sessions_by_token[plain_token] = record.id
+        return record, plain_token
 
 
 class SupabaseAuthRepository(_BaseAuthRepository):
@@ -230,7 +207,7 @@ class SupabaseAuthRepository(_BaseAuthRepository):
         service_role_key: str,
         database_url: str | None = None,
         users_table: str = "users",
-        api_keys_table: str = "api_keys",
+        sessions_table: str = "sessions",
     ) -> None:
         self.supabase_url = supabase_url.rstrip("/") + "/"
         self.headers = {
@@ -239,7 +216,7 @@ class SupabaseAuthRepository(_BaseAuthRepository):
             "Content-Type": "application/json",
         }
         self.users_table = users_table
-        self.api_keys_table = api_keys_table
+        self.sessions_table = sessions_table
         if database_url:
             self._bootstrap_schema(database_url)
 
@@ -258,12 +235,16 @@ class SupabaseAuthRepository(_BaseAuthRepository):
             "password_salt": salt,
             "password_hash": password_hash,
             "mlkem_public_key_hex": public_key.hex(),
-            "mlkem_private_key_hex": secret_key.hex(),
             "is_active": True,
         }
         user = self._insert(self.users_table, user_payload)
-        api_key_record, plain_api_key = self.issue_api_key(user["id"], label="default", ttl_seconds=DEFAULT_API_KEY_TTL_SECONDS)
-        return AuthSession(user=_user_from_row(user), api_key=api_key_record, plain_api_key=plain_api_key)
+        session_record, plain_token = self._insert_session(user["id"])
+        return AuthSession(
+            user=_user_from_row(user),
+            session_token=plain_token,
+            session=session_record,
+            mlkem_private_key=secret_key.hex()
+        )
 
     def authenticate(self, email: str, password: str) -> AuthSession:
         normalized_email = email.strip().lower()
@@ -273,49 +254,25 @@ class SupabaseAuthRepository(_BaseAuthRepository):
         user = _user_from_row(user_row)
         if not _verify_password(password, user.password_salt, user.password_hash):
             raise AuthError("Invalid credentials")
-        api_key_record, plain_api_key = self.issue_api_key(user.id, label="login", ttl_seconds=DEFAULT_API_KEY_TTL_SECONDS)
-        return AuthSession(user=user, api_key=api_key_record, plain_api_key=plain_api_key)
+        session_record, plain_token = self._insert_session(user.id)
+        return AuthSession(user=user, session_token=plain_token, session=session_record)
 
-    def issue_api_key(self, user_id: str, label: str = "default", ttl_seconds: int = DEFAULT_API_KEY_TTL_SECONDS) -> tuple[ApiKeyRecord, str]:
-        plain_api_key = _issue_plain_api_key()
-        created_at = time.time()
-        record = self._insert(
-            self.api_keys_table,
-            {
-                "user_id": user_id,
-                "key_hash": _hash_api_key(plain_api_key),
-                "key_prefix": plain_api_key[:8],
-                "label": label,
-                "created_at": created_at,
-                "expires_at": created_at + ttl_seconds if ttl_seconds else None,
-                "revoked_at": None,
-                "last_used_at": None,
-            },
-        )
-        return _api_key_from_row(record), plain_api_key
+    def logout(self, session_token: str) -> None:
+        session = self._select_one(self.sessions_table, {"session_token": f"eq.{session_token}"})
+        if session is not None:
+            self._patch(self.sessions_table, session["id"], {"revoked_at": time.time()})
 
-    def verify_api_key(self, api_key: str) -> tuple[UserRecord, ApiKeyRecord]:
-        key_hash = _hash_api_key(api_key)
-        key_row = self._select_one(self.api_keys_table, {"key_hash": f"eq.{key_hash}", "revoked_at": "is.null"})
-        if key_row is None:
+    def verify_session(self, session_token: str) -> tuple[UserRecord, SessionRecord]:
+        session_row = self._select_one(self.sessions_table, {"session_token": f"eq.{session_token}", "revoked_at": "is.null"})
+        if session_row is None:
             raise AuthError("Unauthorized")
-        api_key_record = _api_key_from_row(key_row)
-        if api_key_record.expires_at is not None and api_key_record.expires_at < time.time():
+        session_record = _session_from_row(session_row)
+        if session_record.expires_at < time.time():
             raise AuthError("Unauthorized")
-        user_row = self._select_one(self.users_table, {"id": f"eq.{api_key_record.user_id}"})
+        user_row = self._select_one(self.users_table, {"id": f"eq.{session_record.user_id}"})
         if user_row is None or not user_row.get("is_active", True):
             raise AuthError("Unauthorized")
-        self._patch(self.api_keys_table, api_key_record.id, {"last_used_at": time.time()})
-        return _user_from_row(user_row), api_key_record
-
-    def list_api_keys(self, user_id: str) -> list[ApiKeyRecord]:
-        return [_api_key_from_row(row) for row in self._select(self.api_keys_table, {"user_id": f"eq.{user_id}"})]
-
-    def revoke_api_key(self, user_id: str, api_key_id: str) -> None:
-        key = self._select_one(self.api_keys_table, {"id": f"eq.{api_key_id}", "user_id": f"eq.{user_id}"})
-        if key is None:
-            raise AuthError("API key not found")
-        self._patch(self.api_keys_table, api_key_id, {"revoked_at": time.time()})
+        return _user_from_row(user_row), session_record
 
     def get_user_by_id(self, user_id: str) -> UserRecord:
         user_row = self._select_one(self.users_table, {"id": f"eq.{user_id}"})
@@ -323,18 +280,32 @@ class SupabaseAuthRepository(_BaseAuthRepository):
             raise AuthError("User not found")
         return _user_from_row(user_row)
 
-    def rotate_mlkem_keys(self, user_id: str) -> UserRecord:
+    def rotate_mlkem_keys(self, user_id: str) -> tuple[UserRecord, str]:
         user_row = self._select_one(self.users_table, {"id": f"eq.{user_id}"})
         if user_row is None:
             raise AuthError("User not found")
         public_key, secret_key = generate_keys()
         updates = {
             "mlkem_public_key_hex": public_key.hex(),
-            "mlkem_private_key_hex": secret_key.hex(),
         }
         self._patch(self.users_table, user_id, updates)
         user_row.update(updates)
-        return _user_from_row(user_row)
+        return _user_from_row(user_row), secret_key.hex()
+
+    def _insert_session(self, user_id: str, ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS) -> tuple[SessionRecord, str]:
+        plain_token = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
+        created_at = time.time()
+        record = self._insert(
+            self.sessions_table,
+            {
+                "user_id": user_id,
+                "session_token": plain_token,
+                "created_at": created_at,
+                "expires_at": created_at + ttl_seconds,
+                "revoked_at": None,
+            },
+        )
+        return _session_from_row(record), plain_token
 
     def _select(self, table: str, filters: dict[str, str]) -> list[dict[str, Any]]:
         params = {"select": "*", **filters}
@@ -390,6 +361,227 @@ class SupabaseAuthRepository(_BaseAuthRepository):
                 cursor.execute(SUPABASE_SCHEMA_SQL)
 
 
+class SQLAlchemyAuthRepository(_BaseAuthRepository):
+    def __init__(self, database_url: str) -> None:
+        self.engine = create_engine(database_url, poolclass=NullPool)
+        self._bootstrap_schema()
+
+    def _bootstrap_schema(self) -> None:
+        with self.engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(SUPABASE_SCHEMA_SQL))
+
+    def create_user(self, email: str, full_name: str, password: str) -> AuthSession:
+        normalized_email = email.strip().lower()
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT id FROM users WHERE email = :email"),
+                {"email": normalized_email}
+            ).fetchone()
+            if result is not None:
+                raise AuthError("Email already registered")
+
+            salt = secrets.token_hex(PASSWORD_SALT_BYTES)
+            password_hash = _hash_password(password, salt)
+            public_key, secret_key = generate_keys()
+            user_id = secrets.token_urlsafe(16)
+            created_at = time.time()
+
+            with conn.begin():
+                conn.execute(
+                    text("""
+                        INSERT INTO users (id, email, full_name, password_salt, password_hash, mlkem_public_key_hex, created_at, is_active)
+                        VALUES (:id, :email, :full_name, :password_salt, :password_hash, :mlkem_public_key_hex, :created_at, :is_active)
+                    """),
+                    {
+                        "id": user_id,
+                        "email": normalized_email,
+                        "full_name": full_name.strip(),
+                        "password_salt": salt,
+                        "password_hash": password_hash,
+                        "mlkem_public_key_hex": public_key.hex(),
+                        "created_at": created_at,
+                        "is_active": True
+                    }
+                )
+
+            session_record, plain_token = self._insert_session(conn, user_id)
+            user = UserRecord(
+                id=user_id,
+                email=normalized_email,
+                full_name=full_name.strip(),
+                password_salt=salt,
+                password_hash=password_hash,
+                mlkem_public_key_hex=public_key.hex(),
+                created_at=created_at,
+                is_active=True
+            )
+            return AuthSession(
+                user=user,
+                session_token=plain_token,
+                session=session_record,
+                mlkem_private_key=secret_key.hex()
+            )
+
+    def authenticate(self, email: str, password: str) -> AuthSession:
+        normalized_email = email.strip().lower()
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT * FROM users WHERE email = :email"),
+                {"email": normalized_email}
+            ).fetchone()
+            if row is None:
+                raise AuthError("Invalid credentials")
+
+            user = UserRecord(
+                id=row.id,
+                email=row.email,
+                full_name=row.full_name,
+                password_salt=row.password_salt,
+                password_hash=row.password_hash,
+                mlkem_public_key_hex=row.mlkem_public_key_hex,
+                created_at=float(row.created_at),
+                is_active=bool(row.is_active)
+            )
+
+            if not _verify_password(password, user.password_salt, user.password_hash):
+                raise AuthError("Invalid credentials")
+
+            session_record, plain_token = self._insert_session(conn, user.id)
+            return AuthSession(user=user, session_token=plain_token, session=session_record)
+
+    def logout(self, session_token: str) -> None:
+        with self.engine.connect() as conn:
+            with conn.begin():
+                conn.execute(
+                    text("UPDATE sessions SET revoked_at = :revoked_at WHERE session_token = :token"),
+                    {"revoked_at": time.time(), "token": session_token}
+                )
+
+    def verify_session(self, session_token: str) -> tuple[UserRecord, SessionRecord]:
+        with self.engine.connect() as conn:
+            s_row = conn.execute(
+                text("SELECT * FROM sessions WHERE session_token = :token AND revoked_at IS NULL"),
+                {"token": session_token}
+            ).fetchone()
+            if s_row is None:
+                raise AuthError("Unauthorized")
+
+            session_record = SessionRecord(
+                id=s_row.id,
+                user_id=s_row.user_id,
+                session_token=s_row.session_token,
+                created_at=float(s_row.created_at),
+                expires_at=float(s_row.expires_at),
+                revoked_at=None
+            )
+
+            if session_record.expires_at < time.time():
+                raise AuthError("Unauthorized")
+
+            u_row = conn.execute(
+                text("SELECT * FROM users WHERE id = :id"),
+                {"id": session_record.user_id}
+            ).fetchone()
+
+            if u_row is None or not bool(u_row.is_active):
+                raise AuthError("Unauthorized")
+
+            user_record = UserRecord(
+                id=u_row.id,
+                email=u_row.email,
+                full_name=u_row.full_name,
+                password_salt=u_row.password_salt,
+                password_hash=u_row.password_hash,
+                mlkem_public_key_hex=u_row.mlkem_public_key_hex,
+                created_at=float(u_row.created_at),
+                is_active=bool(u_row.is_active)
+            )
+            return user_record, session_record
+
+    def get_user_by_id(self, user_id: str) -> UserRecord:
+        with self.engine.connect() as conn:
+            u_row = conn.execute(
+                text("SELECT * FROM users WHERE id = :id"),
+                {"id": user_id}
+            ).fetchone()
+            if u_row is None:
+                raise AuthError("User not found")
+            return UserRecord(
+                id=u_row.id,
+                email=u_row.email,
+                full_name=u_row.full_name,
+                password_salt=u_row.password_salt,
+                password_hash=u_row.password_hash,
+                mlkem_public_key_hex=u_row.mlkem_public_key_hex,
+                created_at=float(u_row.created_at),
+                is_active=bool(u_row.is_active)
+            )
+
+    def rotate_mlkem_keys(self, user_id: str) -> tuple[UserRecord, str]:
+        with self.engine.connect() as conn:
+            u_row = conn.execute(
+                text("SELECT * FROM users WHERE id = :id"),
+                {"id": user_id}
+            ).fetchone()
+            if u_row is None:
+                raise AuthError("User not found")
+
+            public_key, secret_key = generate_keys()
+            with conn.begin():
+                conn.execute(
+                    text("""
+                        UPDATE users 
+                        SET mlkem_public_key_hex = :pk
+                        WHERE id = :id
+                    """),
+                    {"pk": public_key.hex(), "id": user_id}
+                )
+
+            user_record = UserRecord(
+                id=u_row.id,
+                email=u_row.email,
+                full_name=u_row.full_name,
+                password_salt=u_row.password_salt,
+                password_hash=u_row.password_hash,
+                mlkem_public_key_hex=public_key.hex(),
+                created_at=float(u_row.created_at),
+                is_active=bool(u_row.is_active)
+            )
+            return user_record, secret_key.hex()
+
+    def _insert_session(self, conn, user_id: str, ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS) -> tuple[SessionRecord, str]:
+        plain_token = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
+        session_id = secrets.token_urlsafe(16)
+        created_at = time.time()
+        expires_at = created_at + ttl_seconds
+
+        with conn.begin():
+            conn.execute(
+                text("""
+                    INSERT INTO sessions (id, user_id, session_token, created_at, expires_at, revoked_at)
+                    VALUES (:id, :user_id, :session_token, :created_at, :expires_at, NULL)
+                """),
+                {
+                    "id": session_id,
+                    "user_id": user_id,
+                    "session_token": plain_token,
+                    "created_at": created_at,
+                    "expires_at": expires_at
+                }
+            )
+
+        record = SessionRecord(
+            id=session_id,
+            user_id=user_id,
+            session_token=plain_token,
+            created_at=created_at,
+            expires_at=expires_at,
+            revoked_at=None
+        )
+        return record, plain_token
+
+
 _repo: _BaseAuthRepository | None = None
 _repo_lock = threading.RLock()
 
@@ -402,29 +594,21 @@ def get_auth_repository() -> _BaseAuthRepository:
     with _repo_lock:
         if _repo is not None:
             return _repo
-        supabase_url = os.getenv("SUPABASE_URL", "").strip()
-        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-        if supabase_url and supabase_key:
-            database_url = os.getenv("SUPABASE_DB_URL", os.getenv("DATABASE_URL", "")).strip() or None
-            _repo = SupabaseAuthRepository(supabase_url, supabase_key, database_url=database_url)
+        user = os.getenv("user", "").strip()
+        password = os.getenv("password", "").strip()
+        host = os.getenv("host", "").strip()
+        port = os.getenv("port", "6543").strip()
+        dbname = os.getenv("dbname", "postgres").strip()
+
+        if user and password and host:
+            import urllib.parse
+            safe_user = urllib.parse.quote_plus(user)
+            safe_password = urllib.parse.quote_plus(password)
+            database_url = f"postgresql+psycopg2://{safe_user}:{safe_password}@{host}:{port}/{dbname}?sslmode=require"
+            _repo = SQLAlchemyAuthRepository(database_url)
         else:
             _repo = InMemoryAuthRepository()
         return _repo
-
-
-def hash_api_key_for_storage(api_key: str) -> str:
-    return _hash_api_key(api_key)
-
-
-def _issue_plain_api_key(prefix: str | None = None) -> str:
-    token = secrets.token_urlsafe(API_KEY_BYTES)
-    if prefix:
-        return prefix + token[len(prefix):]
-    return token
-
-
-def _hash_api_key(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
 def _hash_password(password: str, salt_hex: str) -> str:
@@ -445,21 +629,17 @@ def _user_from_row(row: dict[str, Any]) -> UserRecord:
         password_salt=row["password_salt"],
         password_hash=row["password_hash"],
         mlkem_public_key_hex=row.get("mlkem_public_key_hex", ""),
-        mlkem_private_key_hex=row.get("mlkem_private_key_hex", ""),
         created_at=float(row.get("created_at", time.time())),
         is_active=bool(row.get("is_active", True)),
     )
 
 
-def _api_key_from_row(row: dict[str, Any]) -> ApiKeyRecord:
-    return ApiKeyRecord(
+def _session_from_row(row: dict[str, Any]) -> SessionRecord:
+    return SessionRecord(
         id=row["id"],
         user_id=row["user_id"],
-        key_hash=row["key_hash"],
-        key_prefix=row.get("key_prefix", ""),
-        label=row.get("label", "default"),
+        session_token=row["session_token"],
         created_at=float(row.get("created_at", time.time())),
-        expires_at=row.get("expires_at"),
+        expires_at=float(row.get("expires_at", time.time())),
         revoked_at=row.get("revoked_at"),
-        last_used_at=row.get("last_used_at"),
     )
